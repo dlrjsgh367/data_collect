@@ -2,6 +2,7 @@ import os
 import re
 import time
 from tempfile import mkdtemp
+from abc import ABC, abstractmethod
 
 import pandas as pd
 from tqdm import tqdm
@@ -16,17 +17,17 @@ from selenium.common.exceptions import (
     TimeoutException,
     )
 
-class NewsCrawler():
-    
-    def __init__(self,
-                site_name: str,  # 크롤링할 사이트 (네이버 또는 다음)
-                media_company_codes: tuple[str],  # 크롤링할 언론사 코드 목록
-                section_codes: tuple[str],  # 크롤링할 섹션 코드 목록
-                scroll_range: int  # 수집할 페이지 수
-                ):
-        
+class WebDriver:
+    """
+    셀레니움 크롬 웹 드라이버
+    """
+    def __init__(self, chrome_version):
+        """
+        자신의 크롬 버전을 입력
+        e. g) '124.0.6367.119'
+        """
         self.options = webdriver.ChromeOptions()
-        # self.options.add_argument('--headless')+
+        # self.options.add_argument('--headless')
         self.options.add_argument('--no-sandbox')
         self.options.add_argument("--disable-gpu")
         self.options.add_argument("--window-size=1280x1696")
@@ -41,194 +42,237 @@ class NewsCrawler():
         self.options.add_experimental_option('excludeSwitches', ['enable-logging'])
         self.options.add_experimental_option("excludeSwitches", ["enable-automation"])
         self.options.add_experimental_option("useAutomationExtension", False)
-        self.options.add_experimental_option("detach", True)
+        self.options.add_experimental_option("detach", False)
         
-        self.webdriver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=self.options)
-        self.wait = WebDriverWait(self.webdriver, 10)  # 10초간 대기
-        
-        self.DATA_DIR = os.getenv("DATA_DIR")
-        self.site_name = site_name
-        self.media_company_codes = media_company_codes
-        self.section_codes = section_codes
-        self.scroll_range = scroll_range
-        
-        self.content_urls = None
-        
-        if self.site_name == "naver":
-            self.url = os.getenv("NAVER_NEWS_URL")
-            self.crawl_naver_news()
-        elif self.site_name == "daum":
-            self.url = os.getenv("DAUM_NEWS_URL")
-            self.crawl_daum_news()
-        else:   
-            raise "아오 둘중 하나 골라!!"
-        
-    def crawl_naver_news(self):
-        for media_companmy_code in self.media_company_codes:
-            # for section_code in self.section_codes:
-            # link_collect_target = f"https://media.naver.com/press/{media_companmy_code}?sid={self.section_codes}"
-            link_collect_target = f"https://media.naver.com/press/{media_companmy_code}"
-            try:
-                self.naver_news_link_collect(media_company_url=link_collect_target)
-                print("음")
-            except Exception as e:
-                with open("err_record.txt", 'a', encoding='utf8') as f:
-                    f.write(str(e) + '\n' + link_collect_target)
-                print("링크 수집 중 예외 발생")
-                continue
-            else:
-                self.naver_news_crawling()
-                print("오")
-        
-    def crawl_daum_news(self):
-        for media_companmy_code in self.media_company_codes:
-            link_collect_target = f"https://v.daum.net/channel/{media_companmy_code}/contents"
-            try:
-                self.daum_news_link_collect(media_company_url=link_collect_target)
-                print("음")
-            except Exception as e:
-                with open("err_record.txt", 'a', encoding='utf8') as f:
-                    f.write(str(e) + '\n' + link_collect_target)
-                print("링크 수집 중 예외 발생")
-                continue
-            else:
-                self.daum_news_crawling()
-                print("오")
-            quit()
+        self.webdriver = webdriver.Chrome(service=Service(ChromeDriverManager(chrome_version).install()), options=self.options)
+        self.wait = WebDriverWait(self.webdriver, 10)
+
+class NewsCrawlerInterface(ABC):
+    @abstractmethod
+    def news_crawler(self):
+        pass
     
-    def naver_news_link_collect(self, media_company_url:str):
-        self.webdriver.get(media_company_url)
+    @abstractmethod
+    def news_content_link_collect(self):
+        pass
+    
+    @abstractmethod
+    def news_content_parsing(self):
+        pass
+    
+    @abstractmethod
+    def file_save(self):
+        pass
+    
+class NaverNewsCrawler(WebDriver, NewsCrawlerInterface):
+    """
+    daum 뉴스 기사를 언론사별로 크롤링 하는 클래스
+    """
+    def __init__(self, chrome_version, scroll_range, press_link_list, press_name_list):
+        """
+        입력
+            크롬 브라우저 버전
+            언론사 메인 페이지 링크 목록
+            언론사명 목록
+        """
+        # 부모 클래스 WebDriver에서 웹 드라이버가 실행됨
+        super().__init__(chrome_version)
+        self.scroll_range = range(scroll_range)
+        self.press_link_list = press_link_list
+        self.press_name_list = press_name_list
+        self.content_link_list = []
+        self.press_name = ""
         
-        collect_range = range(self.scroll_range*3)
-        with tqdm(collect_range) as pbar:
-            pbar.set_description(f"link collecting.. ")
-            for _ in pbar:
-                try:
+        # 데이터 출력 경로
+        self.data_dir = os.getenv("DATA_DIR")
+        # 데이터 칼럼
+        self.columns = "press title date article".split()
+        # 네이버 섹션 딕셔너리
+        self.section_dict = {
+            "주요뉴스": "",
+            "정치": "100",
+            "경제": "101",
+            "사회": "102",
+            "생활": "103",
+            "세계": "104",
+            "it": "105",
+            "사설/칼럼": "110",
+            "총선": "165"
+        }
+        # 네이버 섹션 딕셔너리의 k-v를 스왑한 딕셔너리
+        self.reverse_section_dict = dict((v,k) for k,v in self.section_dict.items())
+        
+        # 크롤링 시작
+        self.news_crawler()
+        
+    def news_crawler(self):
+        """
+        언론사 메인 페이지 링크 목록, 언론사명 목록을 zip으로 묶고 for-each
+            self.press_name 변수에 press_name 주소를 할당
+            self.news_content_link_collect()에 언론사 메인 페이지 링크를 전달함
+        """
+        for press_link, press_name in zip(self.press_link_list, self.press_name_list):
+            self.press_name = press_name
+            self.news_content_link_collect(press_link)
+            self.news_content_parsing()
+            
+    
+    def news_content_link_collect(self, press_link):
+        """
+        []
+        
+        [링크 수집 로직]
+        1. 페이지를 스크롤한다
+            a. html에 노출되는 뉴스 컨텐츠가 증가한다
+        2. 스크롤이 끝난다
+        3. html에 존재하는 모든 컨텐츠 정보를 파싱한다
+        4. 3.에서 href 값만 가져온 후 content_link_list에 extend 한다.
+        """
+        # 네이버 언론사 메인 페이지 접근
+        self.webdriver.get(press_link)
+        
+        # 사용 가능한 섹션이 있는지 확인
+        content_section_list = self.wait.until(EC.presence_of_all_elements_located((By.CLASS_NAME, 'press_section_tab_txt')))
+        content_section_code_list = [x.text for x in content_section_list]
+        available_section_code_list = [self.section_dict.get(x) for x in content_section_code_list
+                                       if self.section_dict.get(x) is not None]
+        
+        # 사용 가능한 섹션 코드로 뉴스 컨텐츠 링크 생성
+        available_section_link_list = [self.content_link_generator(press_link, x) for x in available_section_code_list]
+        
+        # 섹션 별로 뉴스 컨텐츠 링크 수집
+        content_link_list = []
+        for (available_section_link, section_code) in available_section_link_list:
+            self.webdriver.get(available_section_link)
+            with tqdm(self.scroll_range) as pbar:
+                pbar.set_description(f"{self.press_name} {self.reverse_section_dict.get(section_code)} 컨텐츠 링크 수집 중")
+                for _ in pbar:
                     self.webdriver.execute_script("window.scrollBy(0, 1000);")
-                except Exception as e:
-                    raise e
-        try:
+
             sa_text_titles = self.wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "a.press_edit_news_link")))
-        except Exception as e:
-            raise e
-        else:
-            self.content_urls = [content_link.get_attribute("href") for content_link in sa_text_titles[:5]]
-            print(self.content_urls)
-    
-    def naver_news_crawling(self):
-        for content_url in self.content_urls:
-            print(content_url)
-            self.webdriver.get(content_url)
-            
-            title = self.wait.until(EC.presence_of_element_located((By.XPATH, '/html/body/div/div[2]/div/div[1]/div[1]/div[1]/div[2]/h2')))
-            article = self.wait.until(EC.presence_of_element_located((By.XPATH, '/html/body/div/div[2]/div/div[1]/div[1]/div[2]/div[1]')))
-            date = self.wait.until(EC.presence_of_element_located((By.XPATH, '/html/body/div/div[2]/div/div[1]/div[1]/div[1]/div[3]/div[1]/div[1]/span')))
-            media_company = self.wait.until(EC.presence_of_element_located((By.CLASS_NAME, 'media_end_linked_more_point')))
-            
-            data = (media_company.text, title.text, date.get_attribute("data-date-time"), article.text)
-            self.file_save(data=data)
+            content_link_list.extend([content_link.get_attribute("href") for content_link in sa_text_titles])
             time.sleep(3)
+        
+        # content_link_list 값을 self.content_link_list에 할당
+        self.content_link_list = content_link_list
+        
+    def content_link_generator(self, press_link, section_code):
+        if section_code != '':
+            press_link = f'{press_link}?sid={section_code}'
+        return (press_link, section_code)
     
-    def daum_news_link_collect(self, media_company_url:str):
-        self.webdriver.get("https://v.daum.net/channel/259/contents")
-        print("아")
-        collect_range = range(self.scroll_range*3)
-        with tqdm(collect_range) as pbar:
-            pbar.set_description(f"link collecting..")
-            for _ in pbar:
-                try:
-                    self.webdriver.execute_script("window.scrollBy(0, 1000);")
-                    print("스크롤 진행")
-                except Exception as e:
-                    # 진짜 예외 상황.. 
-                    continue
-        try:
-            sa_text_titles = self.wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "a.link_column")))
-        except TimeoutException:
-            raise TimeoutException
-        else:
-            self.content_urls = [content_link.get_attribute("href")
-                                 for content_link in sa_text_titles # 5개씩 수집하기 위해 임시로 슬라이싱 걸어놓음
-                                 if "#none" not in content_link.get_attribute("href")]
-        time.sleep(3)
-    
-    def daum_news_crawling(self):
-        for content_url in self.content_urls:
-            self.webdriver.get(content_url)
-            time.sleep(3)
-            title = self.wait.until(EC.presence_of_element_located((By.CLASS_NAME, 'tit_view')))
-            article = self.wait.until(EC.presence_of_element_located((By.CLASS_NAME, 'article_view')))
-            date = self.wait.until(EC.presence_of_element_located((By.CLASS_NAME, 'num_date')))
-            media_company = self.wait.until(EC.presence_of_element_located((By.ID, 'kakaoServiceLogo')))
-            
-            data = (media_company.text, title.text, date.text, article.text)
-            self.file_save(data=data)
-    
-    def file_save(self, data:list):
-        columns = "media_company, title date article".split()
+    def news_content_parsing(self):
+        with tqdm(self.content_link_list) as content_link_list:
+            content_link_list.set_description("네이버 뉴스 컨텐츠 파싱")            
+            for content_link in content_link_list:
+
+                self.webdriver.get(content_link)
+                
+                title = self.wait.until(EC.presence_of_element_located((By.XPATH, '/html/body/div/div[2]/div/div[1]/div[1]/div[1]/div[2]/h2')))
+                article = self.wait.until(EC.presence_of_element_located((By.XPATH, '/html/body/div/div[2]/div/div[1]/div[1]/div[2]/div[1]')))
+                date = self.wait.until(EC.presence_of_element_located((By.XPATH, '/html/body/div/div[2]/div/div[1]/div[1]/div[1]/div[3]/div[1]/div[1]/span')))
+                media_company = self.wait.until(EC.presence_of_element_located((By.CLASS_NAME, 'media_end_linked_more_point')))
+                
+                data = (media_company.text, title.text, date.get_attribute("data-date-time"), article.text)
+                self.file_save(data)
+                time.sleep(3)
+
+    def file_save(self, data):
         media_company, title, _, _ = data
         
         only_korean = re.compile("[^ㄱ-ㅎㅏ-ㅣ가-힣]+")
         title = re.sub(only_korean, "", title)
-        file_name = f'{self.site_name.upper()}_{title}_{media_company}.xlsx'
-        download_path = os.path.join(self.DATA_DIR, self.site_name, media_company, file_name).replace('\\', '/')
-        print(download_path)
+        
+        file_name = f'NAVER_{title}_{media_company}.xlsx'
+        download_path = os.path.join(self.data_dir, 'TEST', media_company, file_name).replace('\\', '/')
+        
         os.makedirs(os.path.dirname(download_path), exist_ok=True)
-        pd.DataFrame(
-            data=[data],
-            columns=columns).to_excel(download_path)
+        pd.DataFrame(data=[data],columns=self.columns).to_excel(download_path)
+        print(download_path)
+
+class DaumNewsCrawler(WebDriver, NewsCrawlerInterface):
+    """
+    daum 뉴스 기사를 언론사별로 크롤링 하는 클래스
+    """
+    def __init__(self, chrome_version, scroll_range, press_link_list, press_name_list):
+        super().__init__(chrome_version)
+        self.scroll_range = range(scroll_range)
+        self.press_link_list = press_link_list
+        self.press_name_list = press_name_list
+        self.content_link_list = []
+        self.press_name = ""
+        
+        self.data_dir = os.getenv("DATA_DIR")
+        self.columns = "media_company, title date article".split()
+        self.news_crawler()
+        
+    def news_crawler(self):
+        for press_link, press_name in zip(self.press_link_list, self.press_name_list):
+            self.press_name = press_name
+            self.news_content_link_collect(press_link)
+            self.news_content_parsing()
     
-    @staticmethod
-    def naver_media_company_info_to_csv():
-        from bs4 import BeautifulSoup
-        with open('naver_media_companys.html', 'r', encoding='utf8') as f:
-            soup = BeautifulSoup(f, 'html.parser')
-            media_company_links = [(x.select_one('strong').text, x["href"]) for x in soup.select("ul li a.press_list_logo_item")]
-            print(media_company_links)
-            pd.DataFrame(data=media_company_links, columns=["media_company", "url"]).to_csv("naver_media_company.csv", index=False)
+    def news_content_link_collect(self, press_link):
+        # 전체뉴스 섹션
+        press_link = f'{press_link}/contents'
+        
+        # 다음 언론사 메인 페이지 접근
+        self.webdriver.get(press_link)
+        
+        # 뉴스 컨텐츠 링크 수집
+        content_link_list = []
+        with tqdm(self.scroll_range) as pbar:
+            pbar.set_description(f"{self.press_name} 컨텐츠 링크 수집 중")
+            for _ in pbar:
+                self.webdriver.execute_script("window.scrollBy(0, 1000);")
+        
+        sa_text_titles = self.wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "a.link_column")))
+        content_link_list.extend([content_link.get_attribute("href") for content_link in sa_text_titles if "#none" not in content_link.get_attribute("href")])
+        time.sleep(3)
+        self.content_link_list = content_link_list
     
-    @staticmethod
-    def daum_media_company_info_to_csv():
-        from bs4 import BeautifulSoup
-        with open('daum_media_companys.html', 'r', encoding='utf8') as f:
-            soup = BeautifulSoup(f, 'html.parser')
-            media_company_links = [(x.text, x["href"]) for x in soup.select("ul li a.link_txt")]
-            pd.DataFrame(data=media_company_links, columns=["media_company", "url"]).to_csv("daum_media_company.csv", index=False)
-    
-def main(site_name:str) -> tuple[str]:
-    if site_name not in ["naver", "daum"]:
-        return None
-    print(f"{site_name}_media_company.csv")
-    
-    media_company_table = pd.read_csv(f"{site_name}_media_company.csv")
-    media_company = [x.strip() for x in media_company_table["media_company"].tolist()]
-    
-    data_dir = os.getenv("DATA_DIR")
-    site_dir = os.path.join(data_dir, site_name)
-    data = os.listdir(site_dir)
-    
-    remaining_items = list(set(data) ^ set(media_company))
-    args = media_company_table[media_company_table["media_company"].isin(remaining_items)]
-    codes = [os.path.basename(url) for url in args["url"].tolist()]
-    codes = ['133710','268','259','251','305','162','314']
-    print(len(remaining_items))
-    quit()
-    NewsCrawler(
-        site_name=site_name,
-        media_company_codes=codes,
-        section_codes=("101"),
-        scroll_range=10
+    def news_content_parsing(self):
+        with tqdm(self.content_link_list) as content_link_list:
+            content_link_list.set_description(f"{self.press_name} 컨텐츠 파싱 중")            
+            for content_link in content_link_list:
+
+                self.webdriver.get(content_link)
+                
+                title = self.wait.until(EC.presence_of_element_located((By.CLASS_NAME, 'tit_view')))
+                article = self.wait.until(EC.presence_of_element_located((By.CLASS_NAME, 'article_view')))
+                date = self.wait.until(EC.presence_of_element_located((By.CLASS_NAME, 'num_date')))
+                media_company = self.wait.until(EC.presence_of_element_located((By.ID, 'kakaoServiceLogo')))
+                
+                data = (media_company.text, title.text, date.text, article.text)
+                self.file_save(data=data)
+                time.sleep(3)
+
+    def file_save(self, data):
+        media_company, title, _, _ = data
+        
+        only_korean = re.compile("[^ㄱ-ㅎㅏ-ㅣ가-힣]+")
+        title = re.sub(only_korean, "", title)
+        
+        file_name = f'DAUM_{title}_{media_company}.xlsx'
+        download_path = os.path.join(self.data_dir, 'TEST', media_company, file_name).replace('\\', '/')
+        
+        os.makedirs(os.path.dirname(download_path), exist_ok=True)
+        pd.DataFrame(data=[data],columns=self.columns).to_excel(download_path)
+        print(download_path)
+
+def main():
+    press_dataframe = pd.read_csv(r"C:\Users\HAMA\code\workspace\Projects\data_collect\news\daum_media_company.csv")
+    press_link_list = press_dataframe["url"].tolist()
+    press_name_list = press_dataframe["media_company"].tolist()
+    press_link_list = ["https://v.daum.net/channel/8"]
+    DaumNewsCrawler(
+        chrome_version = "124.0.6367.119",
+        press_link_list = press_link_list,
+        press_name_list = press_name_list,
     )
-    
+
 if __name__ == "__main__":
     from dotenv import load_dotenv
-    load_dotenv()
-    
-    # main("daum")
-    # quit()
-    # base_dir = r"C:\Users\HAMA\code\workspace\Storage\news\Data\naver"
-    # folders = [os.path.join(base_dir, x) for x in os.listdir(base_dir)]
-    # for folder in folders:
-    #     if len(os.listdir(folder)) < 5:
-            
-            # media_company_table = pd.read_csv(f"daum_media_company.csv")
+    load_env = load_dotenv()
+    print(load_env)
+    main()
